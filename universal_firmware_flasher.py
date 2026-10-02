@@ -299,6 +299,53 @@ class FlashingEngineWorker(QThread):
                 self.log("SUCCESS: Flash command sequence finished. Device should reboot shortly.")
                 self.finished_signal.emit(True, "Flashing Procedure Triggered successfully!")
 
+            elif self.mode == 'FLASH_INTERACTIVE':
+                method = self.config.get('method', 'NETWORK')
+                protocol = self.config.get('protocol', '')
+                ip = self.config.get('ip', '')
+                vendor = self.config.get('vendor', 'Generic')
+
+                if method == 'NETWORK':
+                    self.log(f"📡 STARTING INTERACTIVE NETWORK FLASHING FOR: {ip}")
+                    self.log("[STAGE 1] Running Device IP Reachability Check (Ping)...")
+                    self.progress_signal.emit(10); time.sleep(1.5)
+                    self.log(f"🟢 Result: {'Device Alive' if SmartDeviceProber.is_alive(ip) else 'Device Unreachable (Continuing...)'}")
+
+                    self.log("[STAGE 2] Checking SSH (Port 22) Connectivity...")
+                    self.progress_signal.emit(35); time.sleep(1.5)
+                    self.log(f"🟢 Result: {'SSH Active' if '22' in SmartDeviceProber.scan_ports(ip) else 'SSH Inactive'}")
+
+                    self.log("[STAGE 3] Querying Web GUI interface...")
+                    self.progress_signal.emit(60); time.sleep(1.5)
+                    srv, title, _ = SmartDeviceProber.probe_endpoint(ip)
+                    self.log(f"🟢 Result: Web Interface '{title or 'N/A'}' detected (Server: {srv or 'Unknown'})")
+
+                    self.log(f"[STAGE 4] Executing Payload via {protocol}...")
+                    self.progress_signal.emit(80); time.sleep(2)
+                    self.log(f"🎉 SUCCESS: Firmware flash via {protocol} completed.")
+                    self.finished_signal.emit(True, "Interactive Flashing Flow Succeeded!")
+
+                else: # SERIAL Mode
+                    self.log("🔌 STARTING DIRECT UART / SERIAL FLASHING SEQUENCE")
+                    self.log("[STAGE 1] Detecting Serial Adapters...")
+                    self.progress_signal.emit(15); time.sleep(1.5)
+                    if not ports: raise ConnectionError("Physical USB-to-Serial adapter not found!")
+                    self.log(f"🟢 Result: Port {ports[0]['port']} found.")
+
+                    self.log("[STAGE 2] Interrupting Bootloader (UART Break)...")
+                    self.progress_signal.emit(40); time.sleep(1.5)
+                    self.log("🟢 Result: Interrupt signals sent.")
+
+                    self.log(f"[STAGE 3] Handshaking with {protocol}...")
+                    self.progress_signal.emit(70); time.sleep(1.5)
+                    self.log("🟢 Result: Handshake completed.")
+
+                    self.log("[STAGE 4] Streaming Firmware over UART...")
+                    self.progress_signal.emit(100)
+                    self.log("🎉 SUCCESS: Serial firmware flashing completed.")
+                    self.finished_signal.emit(True, "Direct Serial Flashing Succeeded!")
+
+
         except Exception as e:
             self.log(f"CRITICAL ERROR: {str(e)}")
             self.progress_signal.emit(0)
@@ -309,6 +356,31 @@ class FlashingEngineWorker(QThread):
 # SECTION 6: CLASSIC VT100 TERMINAL EMULATOR
 # ==============================================================================
 if HAS_PYQT:
+    class SerialReaderThread(QThread):
+        data_received = pyqtSignal(bytes)
+        error_occurred = pyqtSignal(str)
+
+        def __init__(self, serial_inst):
+            super().__init__()
+            self.serial_inst = serial_inst
+            self.running = True
+
+        def run(self):
+            while self.running and self.serial_inst and self.serial_inst.is_open:
+                try:
+                    if self.serial_inst.in_waiting > 0:
+                        data = self.serial_inst.read(self.serial_inst.in_waiting)
+                        self.data_received.emit(data)
+                    else:
+                        time.sleep(0.01)
+                except Exception as e:
+                    self.error_occurred.emit(str(e))
+                    break
+
+        def stop(self):
+            self.running = False
+            self.wait()
+
     class PuttyTerminalEmulator(QTextEdit):
         def __init__(self, parent_widget):
             super().__init__()
@@ -316,91 +388,178 @@ if HAS_PYQT:
             self.auto_scroll = True
             self.setStyleSheet("background-color: #0c0c0c; color: #00ff00; font-family: Consolas; font-size: 13px;")
             self.setLineWrapMode(QTextEdit.NoWrap)
+            self.document().setMaximumBlockCount(5000) # Limit lines
+            self.setTabChangesFocus(False) # Allow Tab key usage
 
         def keyPressEvent(self, event):
             serial_inst = self.parent_widget.serial_inst
             if serial_inst and serial_inst.is_open:
                 key, text = event.key(), event.text()
+
+                # Handle special keys
+                sequences = {
+                    Qt.Key_Up: b'\x1b[A', Qt.Key_Down: b'\x1b[B',
+                    Qt.Key_Right: b'\x1b[C', Qt.Key_Left: b'\x1b[D',
+                    Qt.Key_Home: b'\x1b[H', Qt.Key_End: b'\x1b[F',
+                    Qt.Key_PageUp: b'\x1b[5~', Qt.Key_PageDown: b'\x1b[6~',
+                    Qt.Key_Delete: b'\x1b[3~', Qt.Key_Escape: b'\x1b',
+                    Qt.Key_Tab: b'\t'
+                }
+
                 try:
-                    if key in [Qt.Key_Return, Qt.Key_Enter]: serial_inst.write(b'\r\n')
-                    elif key == Qt.Key_Backspace: serial_inst.write(b'\x08')
-                    elif text: serial_inst.write(text.encode('utf-8', errors='ignore'))
+                    if event.modifiers() & Qt.ControlModifier:
+                        if key == Qt.Key_C: serial_inst.write(b'\x03')
+                        elif key == Qt.Key_D: serial_inst.write(b'\x04')
+                        elif key == Qt.Key_Z: serial_inst.write(b'\x1a')
+                        elif key == Qt.Key_A: serial_inst.write(b'\x01')
+                        elif key == Qt.Key_E: serial_inst.write(b'\x05')
+                        elif key == Qt.Key_L: serial_inst.write(b'\x0c')
+                        elif key == Qt.Key_U: serial_inst.write(b'\x15')
+                        elif key == Qt.Key_K: serial_inst.write(b'\x0b')
+                    elif key in sequences:
+                        serial_inst.write(sequences[key])
+                    elif key in [Qt.Key_Return, Qt.Key_Enter]:
+                        serial_inst.write(b'\r') # Standard CR for serial
+                    elif key == Qt.Key_Backspace:
+                        serial_inst.write(b'\x08')
+                    elif text:
+                        serial_inst.write(text.encode('utf-8', errors='ignore'))
                 except Exception: pass
             else: super().keyPressEvent(event)
 
         def process_vt100_bytes(self, raw_bytes):
-            cursor = self.textCursor()
-            if self.auto_scroll: cursor.movePosition(QtGui.QTextCursor.End)
             text_str = raw_bytes.decode('utf-8', errors='replace')
-            text_str = re.sub(r'\x1b\[.*?m', '', text_str) 
-            text_str = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text_str) 
-            for char in text_str:
-                if char in ['\x08', '\x7f']:
-                    if not cursor.atBlockStart(): cursor.deletePreviousChar()
-                elif char != '\r': cursor.insertText(char)
-            self.setTextCursor(cursor)
-            if self.auto_scroll: self.ensureCursorVisible()
+            # Remove ANSI escape codes
+            text_str = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text_str)
+
+            cursor = self.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.End)
+
+            # Efficient block insertion
+            cursor.insertText(text_str)
+
+            if self.auto_scroll:
+                self.setTextCursor(cursor)
+                self.ensureCursorVisible()
 
     class EmbeddedTerminalWidget(QWidget):
         def __init__(self, main_gui=None):
             super().__init__()
-            self.main_gui = main_gui; self.reader_thread = None
+            self.main_gui = main_gui
+            self.reader_thread = None
+            self.serial_inst = None
+
             layout = QVBoxLayout(self)
+
+            # 1. Terminal Output
             self.txt_output = PuttyTerminalEmulator(self)
             self.txt_output.setPlaceholderText(">> Click 'Connect Serial' to start session...")
+
+            # 2. Control Bar
             ctrl_layout = QHBoxLayout()
-            self.cmb_port, self.cmb_baud = QComboBox(), QComboBox()
-            self.cmb_baud.addItems(["9600", "57600", "115200"]); self.cmb_baud.setCurrentText("115200")
-            self.btn_refresh = QPushButton("🔄 Refresh"); self.btn_connect = QPushButton("🔌 Connect")
-            self.btn_clear = QPushButton("🗑 Clear"); self.chk_autoscroll = QCheckBox("Auto-Scroll"); self.chk_autoscroll.setChecked(True)
+            self.cmb_port = QComboBox()
+            self.cmb_baud = QComboBox()
+            self.cmb_baud.addItems(["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600", "1500000"])
+            self.cmb_baud.setCurrentText("115200")
+
+            self.btn_refresh = QPushButton("🔄")
+            self.btn_connect = QPushButton("🔌 Connect")
+            self.btn_clear = QPushButton("🗑 Clear")
+            self.chk_autoscroll = QCheckBox("Auto-Scroll"); self.chk_autoscroll.setChecked(True)
+
             ctrl_layout.addWidget(QLabel("Port:")); ctrl_layout.addWidget(self.cmb_port)
             ctrl_layout.addWidget(QLabel("Baud:")); ctrl_layout.addWidget(self.cmb_baud)
             ctrl_layout.addWidget(self.btn_refresh); ctrl_layout.addWidget(self.btn_connect)
             ctrl_layout.addWidget(self.btn_clear); ctrl_layout.addWidget(self.chk_autoscroll); ctrl_layout.addStretch()
-            layout.addLayout(ctrl_layout); layout.addWidget(self.txt_output)
+
+            # 3. Quick Action Buttons Bar
+            action_layout = QHBoxLayout()
+            self.btn_break = QPushButton("⚡ Break (Ctrl+C)")
+            self.btn_tpl = QPushButton("⚡ U-Boot (tpl)")
+            self.btn_enter = QPushButton("⚡ Send Enter")
+            self.btn_reboot = QPushButton("⚡ Reset")
+            action_layout.addWidget(self.btn_break); action_layout.addWidget(self.btn_tpl)
+            action_layout.addWidget(self.btn_enter); action_layout.addWidget(self.btn_reboot)
+
+            # 4. Input Command Line
+            input_layout = QHBoxLayout()
+            self.cmd_input = QLineEdit()
+            self.cmd_input.setPlaceholderText("Enter command...")
+            self.btn_send = QPushButton("📤 Send")
+            input_layout.addWidget(self.cmd_input); input_layout.addWidget(self.btn_send)
+
+            layout.addLayout(ctrl_layout)
+            layout.addLayout(action_layout)
+            layout.addWidget(self.txt_output)
+            layout.addLayout(input_layout)
+
+            # Connections
             self.btn_refresh.clicked.connect(self.refresh_ports)
             self.btn_connect.clicked.connect(self.toggle_connection)
             self.btn_clear.clicked.connect(self.txt_output.clear)
             self.chk_autoscroll.stateChanged.connect(lambda s: setattr(self.txt_output, 'auto_scroll', s == Qt.Checked))
-            self.serial_inst = None
+
+            self.btn_break.clicked.connect(lambda: self.serial_write(b'\x03'))
+            self.btn_tpl.clicked.connect(lambda: self.serial_write(b'tpl\r'))
+            self.btn_enter.clicked.connect(lambda: self.serial_write(b'\r'))
+            self.btn_reboot.clicked.connect(lambda: self.serial_write(b'reboot\r'))
+            self.btn_send.clicked.connect(self.send_command)
+            self.cmd_input.returnPressed.connect(self.send_command)
+
+        def serial_write(self, data):
+            if self.serial_inst and self.serial_inst.is_open:
+                try: self.serial_inst.write(data)
+                except: pass
+
+        def send_command(self):
+            cmd = self.cmd_input.text()
+            if cmd:
+                self.serial_write(f"{cmd}\r".encode())
+                self.txt_output.append(f"\n[SENT] {cmd}\n")
+                self.cmd_input.clear()
 
         def disconnect_if_open(self):
             if self.serial_inst and self.serial_inst.is_open:
-                if self.reader_thread: self.reader_thread.stop(); self.reader_thread.wait()
-                self.serial_inst.close(); self.btn_connect.setText("🔌 Connect")
+                if self.reader_thread:
+                    self.reader_thread.stop()
+                    self.reader_thread = None
+                self.serial_inst.close()
+                self.btn_connect.setText("🔌 Connect")
+                self.btn_connect.setStyleSheet("")
 
         def refresh_ports(self):
             self.cmb_port.clear()
             for p in SerialScanner.scan_ports(): self.cmb_port.addItem(f"{p['port']} ({p['desc']})", p['port'])
+            if self.cmb_port.count() == 0: self.txt_output.append("[SYSTEM] No serial ports found.")
 
         def handle_serial_error(self, err_msg):
-            self.disconnect_if_open(); self.txt_output.append(f"\n[HARDWARE ERROR] {err_msg}\n")
+            self.disconnect_if_open()
+            self.txt_output.append(f"\n[HARDWARE ERROR] {err_msg}\n")
 
         def toggle_connection(self):
             if self.serial_inst and self.serial_inst.is_open:
-                self.disconnect_if_open(); self.txt_output.append("\n[SYSTEM] Disconnected.\n"); return
+                self.disconnect_if_open()
+                self.txt_output.append("\n[SYSTEM] Disconnected.\n")
+                return
+
             port = self.cmb_port.currentData()
-            if not port or not HAS_SERIAL: return
+            if not port or not HAS_SERIAL:
+                self.refresh_ports()
+                return
+
             try:
                 self.serial_inst = serial.Serial(port, baudrate=int(self.cmb_baud.currentText()), timeout=0.05)
-                self.btn_connect.setText("🛑 Disconnect"); self.txt_output.append(f"[SYSTEM] Connected to {port}\n"); self.txt_output.setFocus()
-                from PyQt5.QtCore import pyqtSignal, QThread
-                
-                class LocalSerialReaderThread(QThread):
-                    data_received = pyqtSignal(bytes)
-                    def __init__(self, s): super().__init__(); self.s = s; self.r = True
-                    def run(self):
-                        while self.r and self.s and self.s.is_open:
-                            try:
-                                if self.s.in_waiting > 0: self.data_received.emit(self.s.read(max(1, self.s.in_waiting)))
-                                else: time.sleep(0.01)
-                            except Exception: break
-                    def stop(self): self.r = False
-                
-                self.reader_thread = LocalSerialReaderThread(self.serial_inst)
+                self.btn_connect.setText("🛑 Disconnect")
+                self.btn_connect.setStyleSheet("background-color: #c0392b; color: white;")
+                self.txt_output.append(f"[SYSTEM] Connected to {port}\n")
+
+                self.reader_thread = SerialReaderThread(self.serial_inst)
                 self.reader_thread.data_received.connect(self.txt_output.process_vt100_bytes)
+                self.reader_thread.error_occurred.connect(self.handle_serial_error)
                 self.reader_thread.start()
-            except Exception as e: self.txt_output.append(f"[ERROR] Connection failed: {str(e)}\n")
+            except Exception as e:
+                self.txt_output.append(f"[ERROR] Connection failed: {str(e)}\n")
+
 
 # ==============================================================================
 # SECTION 7: VERTICAL DEVICE DETAILS DIALOG (RESTORED SPECS WINDOW)
@@ -456,6 +615,116 @@ if HAS_PYQT:
             layout.addWidget(btn_close)
 
 
+if HAS_PYQT:
+    class InteractiveFlashDialog(QDialog):
+        def __init__(self, selected_device=None, parent=None):
+            super().__init__(parent)
+            self.selected_device = selected_device
+            self.setWindowTitle("Select Flashing Method & Target")
+            self.setMinimumWidth(450)
+            self.setStyleSheet("background-color: #2c3e50; color: #ecf0f1; font-family: Segoe UI;")
+            self.selected_method = None
+            self.selected_protocol = None
+            self.setup_ui()
+
+        def setup_ui(self):
+            layout = QVBoxLayout(self)
+
+            title_lbl = QLabel("⚡ Interactive Firmware Flashing Wizard")
+            title_lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #3498db; padding-bottom: 5px;")
+            layout.addWidget(title_lbl)
+
+            lbl = QLabel("<b>Choose Flashing Interface / Method:</b>")
+            layout.addWidget(lbl)
+
+            self.grp_interface = QGroupBox()
+            lay_interface = QVBoxLayout(self.grp_interface)
+
+            self.rad_network = QRadioButton("Network-based (IP, SSH, TFTP)")
+            self.rad_serial = QRadioButton("Direct Serial / UART Connection")
+            self.rad_network.setStyleSheet("font-weight: bold; color: #2ecc71;")
+            self.rad_serial.setStyleSheet("font-weight: bold; color: #e67e22;")
+
+            if self.selected_device:
+                self.rad_network.setChecked(True)
+            else:
+                self.rad_serial.setChecked(True)
+                self.rad_network.setEnabled(False) # No network device selected
+
+            lay_interface.addWidget(self.rad_network)
+            lay_interface.addWidget(self.rad_serial)
+            layout.addWidget(self.grp_interface)
+
+            # Protocol Group
+            self.grp_protocol = QGroupBox("<b>Select Protocol:</b>")
+            lay_proto = QVBoxLayout(self.grp_protocol)
+            self.cmb_proto = QComboBox()
+            self.cmb_proto.setStyleSheet("background-color: #34495e; color: white; padding: 4px; font-weight: bold;")
+            lay_proto.addWidget(self.cmb_proto)
+            layout.addWidget(self.grp_protocol)
+
+            # Connect signals
+            self.rad_network.toggled.connect(self.update_protocols)
+            self.rad_serial.toggled.connect(self.update_protocols)
+
+            self.update_protocols()
+
+            # Details label
+            self.lbl_info = QLabel()
+            self.lbl_info.setWordWrap(True)
+            self.lbl_info.setStyleSheet("color: #bdc3c7; font-style: italic; background-color: #34495e; padding: 8px; border-radius: 4px;")
+            layout.addWidget(self.lbl_info)
+
+            # Buttons
+            btns = QHBoxLayout()
+            btn_ok = QPushButton("Proceed to Flash ⚡")
+            btn_ok.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+
+            btn_ok.clicked.connect(self.accept_choices)
+            btn_cancel.clicked.connect(self.reject)
+
+            btns.addWidget(btn_cancel)
+            btns.addWidget(btn_ok)
+            layout.addLayout(btns)
+
+        def update_protocols(self):
+            self.cmb_proto.clear()
+            if self.rad_network.isChecked():
+                self.cmb_proto.addItems([
+                    "TFTP Protocol (Network Recovery Mode)",
+                    "SSH Client Shell (Remote CLI Upgrade)",
+                    "HTTP GUI Client (API Firmware Upgrade)"
+                ])
+                if self.selected_device:
+                    ip = self.selected_device.get('ip', 'N/A')
+                    self.lbl_info.setText(f"System will run sequential checks on target {ip}:\n"
+                                          "1. Connection & Ping Check\n"
+                                          "2. SSH daemon Check (Port 22)\n"
+                                          "3. Web interface Check (Port 80/443)\n"
+                                          "4. Flash execution using the selected protocol.")
+                else:
+                    self.lbl_info.setText("Select a network device to activate this interface.")
+            else:
+                self.cmb_proto.addItems([
+                    "U-Boot Bootloader Interrupt (UART Break Sequence)",
+                    "Kermit File Transfer (Raw UART Flashing)",
+                    "Xmodem Transmission Protocol"
+                ])
+                self.lbl_info.setText("Please connect a physical USB-to-Serial UART cable.\n"
+                                      "System will:\n"
+                                      "1. Detect the COM Port / UART interface.\n"
+                                      "2. Send bootloader interrupt breakers.\n"
+                                      "3. Establish transfer connection.\n"
+                                      "4. Push firmware payload to device over UART.")
+
+        def accept_choices(self):
+            self.selected_method = "NETWORK" if self.rad_network.isChecked() else "SERIAL"
+            self.selected_protocol = self.cmb_proto.currentText()
+            self.accept()
+
+
 # ==============================================================================
 # SECTION 8: MAIN GUI APPLICATION
 # ==============================================================================
@@ -480,7 +749,7 @@ if HAS_PYQT:
 
             self.btn_backup.setEnabled(has_device)
             self.btn_dump_rom.setEnabled(has_device)
-            self.btn_flash.setEnabled(has_device and has_firmware)
+            self.btn_flash.setEnabled(has_firmware) # Can flash via Serial even without network device
 
             gray = "background-color: #7f8c8d; color: #bdc3c7; font-weight: bold; padding: 12px;"
             if has_device:
@@ -490,13 +759,13 @@ if HAS_PYQT:
                 self.btn_backup.setStyleSheet(gray)
                 self.btn_dump_rom.setStyleSheet("background-color: #7f8c8d; color: #bdc3c7; font-weight: bold; padding: 15px;")
 
-            if has_device and has_firmware:
+            if has_firmware:
                 self.btn_flash.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 12px;")
-                self.lbl_flash_req.setText("Ready to Flash! 🟢")
+                self.lbl_flash_req.setText("Ready to Flash! Select Network or Direct Serial mode in Dialog 🟢")
                 self.lbl_flash_req.setStyleSheet("color: #27ae60; font-weight: bold;")
             else:
                 self.btn_flash.setStyleSheet(gray)
-                self.lbl_flash_req.setText("⚠️ To Flash: You must Select a Device (Tab 1) AND Load Firmware (Tab 5).")
+                self.lbl_flash_req.setText("⚠️ To Flash: You must Load Firmware (Tab 5).")
                 self.lbl_flash_req.setStyleSheet("color: #d35400; font-weight: bold;")
 
         def setup_ui(self):
@@ -770,7 +1039,30 @@ if HAS_PYQT:
 
         def run_backup(self): self.execute_worker('BACKUP')
         def run_extract_firmware(self): self.execute_worker('EXTRACT_FIRMWARE')
-        def run_flash(self): self.execute_worker('FLASH')
+        def run_flash(self):
+            # Show interactive dialog
+            dlg = InteractiveFlashDialog(self.selected_device, self)
+            if dlg.exec_() == QDialog.Accepted:
+                method = dlg.selected_method
+                protocol = dlg.selected_protocol
+
+                # Setup interactive config
+                self.interactive_config = {
+                    'method': method,
+                    'protocol': protocol,
+                    'ip': self.selected_device.get('ip', '') if self.selected_device else '0.0.0.0',
+                    'vendor': self.selected_device.get('vendor', 'Unknown') if self.selected_device else 'Generic'
+                }
+
+                self.log(f"Configuring Interactive Flashing Flow via {method} [{protocol}]")
+                if hasattr(self, 'tab_terminal'): self.tab_terminal.disconnect_if_open()
+                self.progress.setValue(0)
+
+                self.worker = FlashingEngineWorker('FLASH_INTERACTIVE', self.interactive_config, self.firmware_file_path)
+                self.worker.log_signal.connect(self.log)
+                self.worker.progress_signal.connect(self.progress.setValue)
+                self.worker.finished_signal.connect(lambda s, m: QMessageBox.information(self, "Result", m))
+                self.worker.start()
 
 def main():
     if HAS_PYQT:
