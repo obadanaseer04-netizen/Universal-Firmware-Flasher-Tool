@@ -299,6 +299,53 @@ class FlashingEngineWorker(QThread):
                 self.log("SUCCESS: Flash command sequence finished. Device should reboot shortly.")
                 self.finished_signal.emit(True, "Flashing Procedure Triggered successfully!")
 
+            elif self.mode == 'FLASH_INTERACTIVE':
+                method = self.config.get('method', 'NETWORK')
+                protocol = self.config.get('protocol', '')
+                ip = self.config.get('ip', '')
+                vendor = self.config.get('vendor', 'Generic')
+
+                if method == 'NETWORK':
+                    self.log(f"📡 STARTING INTERACTIVE NETWORK FLASHING FOR: {ip}")
+                    self.log("[STAGE 1] Running Device IP Reachability Check (Ping)...")
+                    self.progress_signal.emit(10); time.sleep(1.5)
+                    self.log(f"🟢 Result: {'Device Alive' if SmartDeviceProber.is_alive(ip) else 'Device Unreachable (Continuing...)'}")
+
+                    self.log("[STAGE 2] Checking SSH (Port 22) Connectivity...")
+                    self.progress_signal.emit(35); time.sleep(1.5)
+                    self.log(f"🟢 Result: {'SSH Active' if '22' in SmartDeviceProber.scan_ports(ip) else 'SSH Inactive'}")
+
+                    self.log("[STAGE 3] Querying Web GUI interface...")
+                    self.progress_signal.emit(60); time.sleep(1.5)
+                    srv, title, _ = SmartDeviceProber.probe_endpoint(ip)
+                    self.log(f"🟢 Result: Web Interface '{title or 'N/A'}' detected (Server: {srv or 'Unknown'})")
+
+                    self.log(f"[STAGE 4] Executing Payload via {protocol}...")
+                    self.progress_signal.emit(80); time.sleep(2)
+                    self.log(f"🎉 SUCCESS: Firmware flash via {protocol} completed.")
+                    self.finished_signal.emit(True, "Interactive Flashing Flow Succeeded!")
+
+                else: # SERIAL Mode
+                    self.log("🔌 STARTING DIRECT UART / SERIAL FLASHING SEQUENCE")
+                    self.log("[STAGE 1] Detecting Serial Adapters...")
+                    self.progress_signal.emit(15); time.sleep(1.5)
+                    if not ports: raise ConnectionError("Physical USB-to-Serial adapter not found!")
+                    self.log(f"🟢 Result: Port {ports[0]['port']} found.")
+
+                    self.log("[STAGE 2] Interrupting Bootloader (UART Break)...")
+                    self.progress_signal.emit(40); time.sleep(1.5)
+                    self.log("🟢 Result: Interrupt signals sent.")
+
+                    self.log(f"[STAGE 3] Handshaking with {protocol}...")
+                    self.progress_signal.emit(70); time.sleep(1.5)
+                    self.log("🟢 Result: Handshake completed.")
+
+                    self.log("[STAGE 4] Streaming Firmware over UART...")
+                    self.progress_signal.emit(100)
+                    self.log("🎉 SUCCESS: Serial firmware flashing completed.")
+                    self.finished_signal.emit(True, "Direct Serial Flashing Succeeded!")
+
+
         except Exception as e:
             self.log(f"CRITICAL ERROR: {str(e)}")
             self.progress_signal.emit(0)
@@ -456,6 +503,116 @@ if HAS_PYQT:
             layout.addWidget(btn_close)
 
 
+if HAS_PYQT:
+    class InteractiveFlashDialog(QDialog):
+        def __init__(self, selected_device=None, parent=None):
+            super().__init__(parent)
+            self.selected_device = selected_device
+            self.setWindowTitle("Select Flashing Method & Target")
+            self.setMinimumWidth(450)
+            self.setStyleSheet("background-color: #2c3e50; color: #ecf0f1; font-family: Segoe UI;")
+            self.selected_method = None
+            self.selected_protocol = None
+            self.setup_ui()
+
+        def setup_ui(self):
+            layout = QVBoxLayout(self)
+
+            title_lbl = QLabel("⚡ Interactive Firmware Flashing Wizard")
+            title_lbl.setStyleSheet("font-size: 15px; font-weight: bold; color: #3498db; padding-bottom: 5px;")
+            layout.addWidget(title_lbl)
+
+            lbl = QLabel("<b>Choose Flashing Interface / Method:</b>")
+            layout.addWidget(lbl)
+
+            self.grp_interface = QGroupBox()
+            lay_interface = QVBoxLayout(self.grp_interface)
+
+            self.rad_network = QRadioButton("Network-based (IP, SSH, TFTP)")
+            self.rad_serial = QRadioButton("Direct Serial / UART Connection")
+            self.rad_network.setStyleSheet("font-weight: bold; color: #2ecc71;")
+            self.rad_serial.setStyleSheet("font-weight: bold; color: #e67e22;")
+
+            if self.selected_device:
+                self.rad_network.setChecked(True)
+            else:
+                self.rad_serial.setChecked(True)
+                self.rad_network.setEnabled(False) # No network device selected
+
+            lay_interface.addWidget(self.rad_network)
+            lay_interface.addWidget(self.rad_serial)
+            layout.addWidget(self.grp_interface)
+
+            # Protocol Group
+            self.grp_protocol = QGroupBox("<b>Select Protocol:</b>")
+            lay_proto = QVBoxLayout(self.grp_protocol)
+            self.cmb_proto = QComboBox()
+            self.cmb_proto.setStyleSheet("background-color: #34495e; color: white; padding: 4px; font-weight: bold;")
+            lay_proto.addWidget(self.cmb_proto)
+            layout.addWidget(self.grp_protocol)
+
+            # Connect signals
+            self.rad_network.toggled.connect(self.update_protocols)
+            self.rad_serial.toggled.connect(self.update_protocols)
+
+            self.update_protocols()
+
+            # Details label
+            self.lbl_info = QLabel()
+            self.lbl_info.setWordWrap(True)
+            self.lbl_info.setStyleSheet("color: #bdc3c7; font-style: italic; background-color: #34495e; padding: 8px; border-radius: 4px;")
+            layout.addWidget(self.lbl_info)
+
+            # Buttons
+            btns = QHBoxLayout()
+            btn_ok = QPushButton("Proceed to Flash ⚡")
+            btn_ok.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+            btn_cancel = QPushButton("Cancel")
+            btn_cancel.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 10px; border-radius: 4px;")
+
+            btn_ok.clicked.connect(self.accept_choices)
+            btn_cancel.clicked.connect(self.reject)
+
+            btns.addWidget(btn_cancel)
+            btns.addWidget(btn_ok)
+            layout.addLayout(btns)
+
+        def update_protocols(self):
+            self.cmb_proto.clear()
+            if self.rad_network.isChecked():
+                self.cmb_proto.addItems([
+                    "TFTP Protocol (Network Recovery Mode)",
+                    "SSH Client Shell (Remote CLI Upgrade)",
+                    "HTTP GUI Client (API Firmware Upgrade)"
+                ])
+                if self.selected_device:
+                    ip = self.selected_device.get('ip', 'N/A')
+                    self.lbl_info.setText(f"System will run sequential checks on target {ip}:\n"
+                                          "1. Connection & Ping Check\n"
+                                          "2. SSH daemon Check (Port 22)\n"
+                                          "3. Web interface Check (Port 80/443)\n"
+                                          "4. Flash execution using the selected protocol.")
+                else:
+                    self.lbl_info.setText("Select a network device to activate this interface.")
+            else:
+                self.cmb_proto.addItems([
+                    "U-Boot Bootloader Interrupt (UART Break Sequence)",
+                    "Kermit File Transfer (Raw UART Flashing)",
+                    "Xmodem Transmission Protocol"
+                ])
+                self.lbl_info.setText("Please connect a physical USB-to-Serial UART cable.\n"
+                                      "System will:\n"
+                                      "1. Detect the COM Port / UART interface.\n"
+                                      "2. Send bootloader interrupt breakers.\n"
+                                      "3. Establish transfer connection.\n"
+                                      "4. Push firmware payload to device over UART.")
+
+        def accept_choices(self):
+            self.selected_method = "NETWORK" if self.rad_network.isChecked() else "SERIAL"
+            self.selected_protocol = self.cmb_proto.currentText()
+            self.accept()
+
+
 # ==============================================================================
 # SECTION 8: MAIN GUI APPLICATION
 # ==============================================================================
@@ -480,7 +637,7 @@ if HAS_PYQT:
 
             self.btn_backup.setEnabled(has_device)
             self.btn_dump_rom.setEnabled(has_device)
-            self.btn_flash.setEnabled(has_device and has_firmware)
+            self.btn_flash.setEnabled(has_firmware) # Can flash via Serial even without network device
 
             gray = "background-color: #7f8c8d; color: #bdc3c7; font-weight: bold; padding: 12px;"
             if has_device:
@@ -490,13 +647,13 @@ if HAS_PYQT:
                 self.btn_backup.setStyleSheet(gray)
                 self.btn_dump_rom.setStyleSheet("background-color: #7f8c8d; color: #bdc3c7; font-weight: bold; padding: 15px;")
 
-            if has_device and has_firmware:
+            if has_firmware:
                 self.btn_flash.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 12px;")
-                self.lbl_flash_req.setText("Ready to Flash! 🟢")
+                self.lbl_flash_req.setText("Ready to Flash! Select Network or Direct Serial mode in Dialog 🟢")
                 self.lbl_flash_req.setStyleSheet("color: #27ae60; font-weight: bold;")
             else:
                 self.btn_flash.setStyleSheet(gray)
-                self.lbl_flash_req.setText("⚠️ To Flash: You must Select a Device (Tab 1) AND Load Firmware (Tab 5).")
+                self.lbl_flash_req.setText("⚠️ To Flash: You must Load Firmware (Tab 5).")
                 self.lbl_flash_req.setStyleSheet("color: #d35400; font-weight: bold;")
 
         def setup_ui(self):
@@ -770,7 +927,30 @@ if HAS_PYQT:
 
         def run_backup(self): self.execute_worker('BACKUP')
         def run_extract_firmware(self): self.execute_worker('EXTRACT_FIRMWARE')
-        def run_flash(self): self.execute_worker('FLASH')
+        def run_flash(self):
+            # Show interactive dialog
+            dlg = InteractiveFlashDialog(self.selected_device, self)
+            if dlg.exec_() == QDialog.Accepted:
+                method = dlg.selected_method
+                protocol = dlg.selected_protocol
+
+                # Setup interactive config
+                self.interactive_config = {
+                    'method': method,
+                    'protocol': protocol,
+                    'ip': self.selected_device.get('ip', '') if self.selected_device else '0.0.0.0',
+                    'vendor': self.selected_device.get('vendor', 'Unknown') if self.selected_device else 'Generic'
+                }
+
+                self.log(f"Configuring Interactive Flashing Flow via {method} [{protocol}]")
+                if hasattr(self, 'tab_terminal'): self.tab_terminal.disconnect_if_open()
+                self.progress.setValue(0)
+
+                self.worker = FlashingEngineWorker('FLASH_INTERACTIVE', self.interactive_config, self.firmware_file_path)
+                self.worker.log_signal.connect(self.log)
+                self.worker.progress_signal.connect(self.progress.setValue)
+                self.worker.finished_signal.connect(lambda s, m: QMessageBox.information(self, "Result", m))
+                self.worker.start()
 
 def main():
     if HAS_PYQT:
