@@ -356,6 +356,31 @@ class FlashingEngineWorker(QThread):
 # SECTION 6: CLASSIC VT100 TERMINAL EMULATOR
 # ==============================================================================
 if HAS_PYQT:
+    class SerialReaderThread(QThread):
+        data_received = pyqtSignal(bytes)
+        error_occurred = pyqtSignal(str)
+
+        def __init__(self, serial_inst):
+            super().__init__()
+            self.serial_inst = serial_inst
+            self.running = True
+
+        def run(self):
+            while self.running and self.serial_inst and self.serial_inst.is_open:
+                try:
+                    if self.serial_inst.in_waiting > 0:
+                        data = self.serial_inst.read(self.serial_inst.in_waiting)
+                        self.data_received.emit(data)
+                    else:
+                        time.sleep(0.01)
+                except Exception as e:
+                    self.error_occurred.emit(str(e))
+                    break
+
+        def stop(self):
+            self.running = False
+            self.wait()
+
     class PuttyTerminalEmulator(QTextEdit):
         def __init__(self, parent_widget):
             super().__init__()
@@ -363,91 +388,178 @@ if HAS_PYQT:
             self.auto_scroll = True
             self.setStyleSheet("background-color: #0c0c0c; color: #00ff00; font-family: Consolas; font-size: 13px;")
             self.setLineWrapMode(QTextEdit.NoWrap)
+            self.document().setMaximumBlockCount(5000) # Limit lines
+            self.setTabChangesFocus(False) # Allow Tab key usage
 
         def keyPressEvent(self, event):
             serial_inst = self.parent_widget.serial_inst
             if serial_inst and serial_inst.is_open:
                 key, text = event.key(), event.text()
+
+                # Handle special keys
+                sequences = {
+                    Qt.Key_Up: b'\x1b[A', Qt.Key_Down: b'\x1b[B',
+                    Qt.Key_Right: b'\x1b[C', Qt.Key_Left: b'\x1b[D',
+                    Qt.Key_Home: b'\x1b[H', Qt.Key_End: b'\x1b[F',
+                    Qt.Key_PageUp: b'\x1b[5~', Qt.Key_PageDown: b'\x1b[6~',
+                    Qt.Key_Delete: b'\x1b[3~', Qt.Key_Escape: b'\x1b',
+                    Qt.Key_Tab: b'\t'
+                }
+
                 try:
-                    if key in [Qt.Key_Return, Qt.Key_Enter]: serial_inst.write(b'\r\n')
-                    elif key == Qt.Key_Backspace: serial_inst.write(b'\x08')
-                    elif text: serial_inst.write(text.encode('utf-8', errors='ignore'))
+                    if event.modifiers() & Qt.ControlModifier:
+                        if key == Qt.Key_C: serial_inst.write(b'\x03')
+                        elif key == Qt.Key_D: serial_inst.write(b'\x04')
+                        elif key == Qt.Key_Z: serial_inst.write(b'\x1a')
+                        elif key == Qt.Key_A: serial_inst.write(b'\x01')
+                        elif key == Qt.Key_E: serial_inst.write(b'\x05')
+                        elif key == Qt.Key_L: serial_inst.write(b'\x0c')
+                        elif key == Qt.Key_U: serial_inst.write(b'\x15')
+                        elif key == Qt.Key_K: serial_inst.write(b'\x0b')
+                    elif key in sequences:
+                        serial_inst.write(sequences[key])
+                    elif key in [Qt.Key_Return, Qt.Key_Enter]:
+                        serial_inst.write(b'\r') # Standard CR for serial
+                    elif key == Qt.Key_Backspace:
+                        serial_inst.write(b'\x08')
+                    elif text:
+                        serial_inst.write(text.encode('utf-8', errors='ignore'))
                 except Exception: pass
             else: super().keyPressEvent(event)
 
         def process_vt100_bytes(self, raw_bytes):
-            cursor = self.textCursor()
-            if self.auto_scroll: cursor.movePosition(QtGui.QTextCursor.End)
             text_str = raw_bytes.decode('utf-8', errors='replace')
-            text_str = re.sub(r'\x1b\[.*?m', '', text_str) 
-            text_str = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text_str) 
-            for char in text_str:
-                if char in ['\x08', '\x7f']:
-                    if not cursor.atBlockStart(): cursor.deletePreviousChar()
-                elif char != '\r': cursor.insertText(char)
-            self.setTextCursor(cursor)
-            if self.auto_scroll: self.ensureCursorVisible()
+            # Remove ANSI escape codes
+            text_str = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text_str)
+
+            cursor = self.textCursor()
+            cursor.movePosition(QtGui.QTextCursor.End)
+
+            # Efficient block insertion
+            cursor.insertText(text_str)
+
+            if self.auto_scroll:
+                self.setTextCursor(cursor)
+                self.ensureCursorVisible()
 
     class EmbeddedTerminalWidget(QWidget):
         def __init__(self, main_gui=None):
             super().__init__()
-            self.main_gui = main_gui; self.reader_thread = None
+            self.main_gui = main_gui
+            self.reader_thread = None
+            self.serial_inst = None
+
             layout = QVBoxLayout(self)
+
+            # 1. Terminal Output
             self.txt_output = PuttyTerminalEmulator(self)
             self.txt_output.setPlaceholderText(">> Click 'Connect Serial' to start session...")
+
+            # 2. Control Bar
             ctrl_layout = QHBoxLayout()
-            self.cmb_port, self.cmb_baud = QComboBox(), QComboBox()
-            self.cmb_baud.addItems(["9600", "57600", "115200"]); self.cmb_baud.setCurrentText("115200")
-            self.btn_refresh = QPushButton("🔄 Refresh"); self.btn_connect = QPushButton("🔌 Connect")
-            self.btn_clear = QPushButton("🗑 Clear"); self.chk_autoscroll = QCheckBox("Auto-Scroll"); self.chk_autoscroll.setChecked(True)
+            self.cmb_port = QComboBox()
+            self.cmb_baud = QComboBox()
+            self.cmb_baud.addItems(["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600", "1500000"])
+            self.cmb_baud.setCurrentText("115200")
+
+            self.btn_refresh = QPushButton("🔄")
+            self.btn_connect = QPushButton("🔌 Connect")
+            self.btn_clear = QPushButton("🗑 Clear")
+            self.chk_autoscroll = QCheckBox("Auto-Scroll"); self.chk_autoscroll.setChecked(True)
+
             ctrl_layout.addWidget(QLabel("Port:")); ctrl_layout.addWidget(self.cmb_port)
             ctrl_layout.addWidget(QLabel("Baud:")); ctrl_layout.addWidget(self.cmb_baud)
             ctrl_layout.addWidget(self.btn_refresh); ctrl_layout.addWidget(self.btn_connect)
             ctrl_layout.addWidget(self.btn_clear); ctrl_layout.addWidget(self.chk_autoscroll); ctrl_layout.addStretch()
-            layout.addLayout(ctrl_layout); layout.addWidget(self.txt_output)
+
+            # 3. Quick Action Buttons Bar
+            action_layout = QHBoxLayout()
+            self.btn_break = QPushButton("⚡ Break (Ctrl+C)")
+            self.btn_tpl = QPushButton("⚡ U-Boot (tpl)")
+            self.btn_enter = QPushButton("⚡ Send Enter")
+            self.btn_reboot = QPushButton("⚡ Reset")
+            action_layout.addWidget(self.btn_break); action_layout.addWidget(self.btn_tpl)
+            action_layout.addWidget(self.btn_enter); action_layout.addWidget(self.btn_reboot)
+
+            # 4. Input Command Line
+            input_layout = QHBoxLayout()
+            self.cmd_input = QLineEdit()
+            self.cmd_input.setPlaceholderText("Enter command...")
+            self.btn_send = QPushButton("📤 Send")
+            input_layout.addWidget(self.cmd_input); input_layout.addWidget(self.btn_send)
+
+            layout.addLayout(ctrl_layout)
+            layout.addLayout(action_layout)
+            layout.addWidget(self.txt_output)
+            layout.addLayout(input_layout)
+
+            # Connections
             self.btn_refresh.clicked.connect(self.refresh_ports)
             self.btn_connect.clicked.connect(self.toggle_connection)
             self.btn_clear.clicked.connect(self.txt_output.clear)
             self.chk_autoscroll.stateChanged.connect(lambda s: setattr(self.txt_output, 'auto_scroll', s == Qt.Checked))
-            self.serial_inst = None
+
+            self.btn_break.clicked.connect(lambda: self.serial_write(b'\x03'))
+            self.btn_tpl.clicked.connect(lambda: self.serial_write(b'tpl\r'))
+            self.btn_enter.clicked.connect(lambda: self.serial_write(b'\r'))
+            self.btn_reboot.clicked.connect(lambda: self.serial_write(b'reboot\r'))
+            self.btn_send.clicked.connect(self.send_command)
+            self.cmd_input.returnPressed.connect(self.send_command)
+
+        def serial_write(self, data):
+            if self.serial_inst and self.serial_inst.is_open:
+                try: self.serial_inst.write(data)
+                except: pass
+
+        def send_command(self):
+            cmd = self.cmd_input.text()
+            if cmd:
+                self.serial_write(f"{cmd}\r".encode())
+                self.txt_output.append(f"\n[SENT] {cmd}\n")
+                self.cmd_input.clear()
 
         def disconnect_if_open(self):
             if self.serial_inst and self.serial_inst.is_open:
-                if self.reader_thread: self.reader_thread.stop(); self.reader_thread.wait()
-                self.serial_inst.close(); self.btn_connect.setText("🔌 Connect")
+                if self.reader_thread:
+                    self.reader_thread.stop()
+                    self.reader_thread = None
+                self.serial_inst.close()
+                self.btn_connect.setText("🔌 Connect")
+                self.btn_connect.setStyleSheet("")
 
         def refresh_ports(self):
             self.cmb_port.clear()
             for p in SerialScanner.scan_ports(): self.cmb_port.addItem(f"{p['port']} ({p['desc']})", p['port'])
+            if self.cmb_port.count() == 0: self.txt_output.append("[SYSTEM] No serial ports found.")
 
         def handle_serial_error(self, err_msg):
-            self.disconnect_if_open(); self.txt_output.append(f"\n[HARDWARE ERROR] {err_msg}\n")
+            self.disconnect_if_open()
+            self.txt_output.append(f"\n[HARDWARE ERROR] {err_msg}\n")
 
         def toggle_connection(self):
             if self.serial_inst and self.serial_inst.is_open:
-                self.disconnect_if_open(); self.txt_output.append("\n[SYSTEM] Disconnected.\n"); return
+                self.disconnect_if_open()
+                self.txt_output.append("\n[SYSTEM] Disconnected.\n")
+                return
+
             port = self.cmb_port.currentData()
-            if not port or not HAS_SERIAL: return
+            if not port or not HAS_SERIAL:
+                self.refresh_ports()
+                return
+
             try:
                 self.serial_inst = serial.Serial(port, baudrate=int(self.cmb_baud.currentText()), timeout=0.05)
-                self.btn_connect.setText("🛑 Disconnect"); self.txt_output.append(f"[SYSTEM] Connected to {port}\n"); self.txt_output.setFocus()
-                from PyQt5.QtCore import pyqtSignal, QThread
-                
-                class LocalSerialReaderThread(QThread):
-                    data_received = pyqtSignal(bytes)
-                    def __init__(self, s): super().__init__(); self.s = s; self.r = True
-                    def run(self):
-                        while self.r and self.s and self.s.is_open:
-                            try:
-                                if self.s.in_waiting > 0: self.data_received.emit(self.s.read(max(1, self.s.in_waiting)))
-                                else: time.sleep(0.01)
-                            except Exception: break
-                    def stop(self): self.r = False
-                
-                self.reader_thread = LocalSerialReaderThread(self.serial_inst)
+                self.btn_connect.setText("🛑 Disconnect")
+                self.btn_connect.setStyleSheet("background-color: #c0392b; color: white;")
+                self.txt_output.append(f"[SYSTEM] Connected to {port}\n")
+
+                self.reader_thread = SerialReaderThread(self.serial_inst)
                 self.reader_thread.data_received.connect(self.txt_output.process_vt100_bytes)
+                self.reader_thread.error_occurred.connect(self.handle_serial_error)
                 self.reader_thread.start()
-            except Exception as e: self.txt_output.append(f"[ERROR] Connection failed: {str(e)}\n")
+            except Exception as e:
+                self.txt_output.append(f"[ERROR] Connection failed: {str(e)}\n")
+
 
 # ==============================================================================
 # SECTION 7: VERTICAL DEVICE DETAILS DIALOG (RESTORED SPECS WINDOW)
