@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tool runtime output (local only)
+firmware_downloads/
+extracted_firmware/
+backups/
+*.log
