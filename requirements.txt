@@ -1,0 +1,9 @@
+# Universal Firmware Flasher Tool — Python dependencies
+PyQt5>=5.15          # GUI
+pyserial>=3.5        # serial console + UART operations
+pyte>=0.8.2          # real VT100 terminal emulation (Page 3)
+paramiko>=3.0        # authenticated SSH/SFTP firmware extraction (Page 4)
+
+# Optional external tool (not a pip package):
+#   nmap  — enables the active Service/Vuln scan button on Page 6.
+#           Install from https://nmap.org and make sure it is on PATH.
